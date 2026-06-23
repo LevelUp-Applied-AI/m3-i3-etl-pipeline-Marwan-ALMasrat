@@ -1,92 +1,94 @@
-"""ETL Pipeline — Amman Digital Market Customer Analytics
-
-Extracts data from PostgreSQL, transforms it into customer-level summaries,
-validates data quality, and loads results to a database table and CSV file.
-"""
+"""ETL Pipeline — Amman Digital Market Customer Analytics"""
 from sqlalchemy import create_engine
 import pandas as pd
 import os
 
 
 def extract(engine):
-    """Extract all source tables from PostgreSQL into DataFrames.
-
-    Args:
-        engine: SQLAlchemy engine connected to the amman_market database
-
-    Returns:
-        dict: {"customers": df, "products": df, "orders": df, "order_items": df}
-    """
-    # TODO: Implement extraction
-    pass
+    tables = ["customers", "products", "orders", "order_items"]
+    data = {}
+    for table in tables:
+        data[table] = pd.read_sql(f"SELECT * FROM {table}", engine)
+        print(f"  Extracted {table}: {len(data[table])} rows")
+    return data
 
 
 def transform(data_dict):
-    """Transform raw data into customer-level analytics summary.
+    customers   = data_dict["customers"]
+    products    = data_dict["products"]
+    orders      = data_dict["orders"]
+    order_items = data_dict["order_items"]
 
-    Steps:
-    1. Join orders with order_items and products
-    2. Compute line_total (quantity * unit_price)
-    3. Filter out cancelled orders (status = 'cancelled')
-    4. Filter out suspicious quantities (quantity > 100)
-    5. Aggregate to customer level: total_orders, total_revenue,
-       avg_order_value, top_category
+    df = order_items.merge(products[["product_id", "unit_price", "category"]], on="product_id")
+    df = df[df["quantity"] <= 100]
+    df["line_total"] = df["quantity"] * df["unit_price"]
+    df = df.merge(orders[["order_id", "customer_id", "status"]], on="order_id")
+    df = df[df["status"] != "cancelled"]
 
-    Args:
-        data_dict: dict of DataFrames from extract()
+    cat_revenue = df.groupby(["customer_id", "category"])["line_total"].sum().reset_index()
+    top_cat = (
+        cat_revenue.sort_values("line_total", ascending=False)
+        .groupby("customer_id").first().reset_index()
+        [["customer_id", "category"]].rename(columns={"category": "top_category"})
+    )
 
-    Returns:
-        DataFrame: customer-level summary with columns:
-            customer_id, customer_name, city, total_orders,
-            total_revenue, avg_order_value, top_category
-    """
-    # TODO: Implement transformation
-    pass
+    summary = (
+        df.groupby("customer_id")
+        .agg(total_orders=("order_id", "nunique"), total_revenue=("line_total", "sum"))
+        .reset_index()
+    )
+    summary["avg_order_value"] = summary["total_revenue"] / summary["total_orders"]
+    summary = summary.merge(
+        customers[["customer_id", "customer_name", "city"]],
+        on="customer_id"
+    )
+    summary = summary.merge(top_cat, on="customer_id")
+
+    return summary[["customer_id", "customer_name", "city", "total_orders",
+                     "total_revenue", "avg_order_value", "top_category"]]
 
 
 def validate(df):
-    """Run data quality checks on the transformed DataFrame.
-
-    Checks:
-    - No nulls in customer_id or customer_name
-    - total_revenue > 0 for all customers
-    - No duplicate customer_ids
-    - total_orders > 0 for all customers
-
-    Args:
-        df: transformed customer summary DataFrame
-
-    Returns:
-        dict: {check_name: bool} for each check
-
-    Raises:
-        ValueError: if any critical check fails
-    """
-    # TODO: Implement validation
-    pass
+    checks = {
+        "no_null_customer_id":    df["customer_id"].notna().all(),
+        "no_null_customer_name":  df["customer_name"].notna().all(),
+        "total_revenue_positive": (df["total_revenue"] > 0).all(),
+        "no_duplicate_customers": df["customer_id"].nunique() == len(df),
+        "total_orders_positive":  (df["total_orders"] > 0).all(),
+    }
+    for check, passed in checks.items():
+        print(f"  [{'PASS' if passed else 'FAIL'}] {check}")
+    if not all(checks.values()):
+        raise ValueError("Data quality check failed!")
+    return checks
 
 
 def load(df, engine, csv_path):
-    """Load customer summary to PostgreSQL table and CSV file.
-
-    Args:
-        df: validated customer summary DataFrame
-        engine: SQLAlchemy engine
-        csv_path: path for CSV output
-    """
-    # TODO: Implement loading
-    pass
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    df.to_sql("customer_analytics", engine, if_exists="replace", index=False)
+    df.to_csv(csv_path, index=False)
+    print(f"  Loaded {len(df)} rows to DB and {csv_path}")
 
 
 def main():
-    """Orchestrate the ETL pipeline: extract -> transform -> validate -> load."""
-    # TODO: Implement main orchestration
-    # 1. Create engine from DATABASE_URL env var (or default)
-    # 2. Extract
-    # 3. Transform
-    # 4. Validate
-    # 5. Load to customer_summary table and output/customer_analytics.csv
-    pass
+
+    DB_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5433/amman_market")
+    engine = create_engine(DB_URL)
+
+    print("=== EXTRACT ===")
+    data = extract(engine)
+
+    print("\n=== TRANSFORM ===")
+    df = transform(data)
+    print(f"  Result: {len(df)} customer rows")
+
+    print("\n=== VALIDATE ===")
+    validate(df)
+
+    print("\n=== LOAD ===")
+    load(df, engine, "output/customer_analytics.csv")
+
+    print("\nDone!")
 
 
 if __name__ == "__main__":
